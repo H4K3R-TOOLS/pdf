@@ -1,5 +1,6 @@
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
+const { NewMessage } = require("telegram/events");
 const express = require("express");
 
 // Configuration
@@ -9,7 +10,7 @@ const API_HASH = process.env.TELEGRAM_API_HASH;
 const SESSION_STRING = process.env.TELEGRAM_SESSION;
 
 // KidCheck Bot username
-const CHECKER_BOT = "@KidCheck_bot";
+const CHECKER_BOT = "KidCheck_bot";
 
 // Express app for health check
 const app = express();
@@ -20,7 +21,11 @@ let client;
 let isChecking = false;
 let cardQueue = [];
 let approvedCards = [];
-let currentUserId = null;
+let myUserId = null;
+let savedMessagesChat = null;
+let checkerBotEntity = null;
+let waitingForResponse = false;
+let currentCard = null;
 
 // Delay function
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,7 +36,6 @@ function parseCard(cardLine) {
   if (parts.length >= 4) {
     let month = parts[1].padStart(2, "0");
     let year = parts[2];
-    // Convert 2-digit year to 4-digit if needed
     if (year.length === 2) {
       year = "20" + year;
     }
@@ -48,125 +52,68 @@ function parseCard(cardLine) {
   return null;
 }
 
-// Check single card
-async function checkCard(card) {
+// Send message to saved messages
+async function sendToSavedMessages(text) {
   try {
-    // Get the checker bot entity
-    const bot = await client.getEntity(CHECKER_BOT);
-
-    // Send the check command
-    const command = `/st ${card.formatted}`;
-    await client.sendMessage(bot, { message: command });
-
-    console.log(`📤 Sent: ${command}`);
-
-    // Wait for response (up to 60 seconds)
-    let response = null;
-    const startTime = Date.now();
-    const timeout = 60000; // 60 seconds
-
-    while (Date.now() - startTime < timeout) {
-      await delay(2000); // Check every 2 seconds
-
-      // Get recent messages from the bot
-      const messages = await client.getMessages(bot, { limit: 5 });
-
-      for (const msg of messages) {
-        if (msg.message && msg.message.includes(card.number.slice(0, 6))) {
-          response = msg.message;
-          break;
-        }
-      }
-
-      if (response) break;
-    }
-
-    if (!response) {
-      return { card, status: "TIMEOUT", response: "No response received" };
-    }
-
-    // Check if approved or declined
-    const isApproved =
-      response.toLowerCase().includes("approved") ||
-      response.toLowerCase().includes("charged") ||
-      response.includes("✅");
-    const isDeclined =
-      response.toLowerCase().includes("declined") ||
-      response.toLowerCase().includes("❌");
-
-    return {
-      card,
-      status: isApproved ? "APPROVED ✅" : isDeclined ? "DECLINED ❌" : "UNKNOWN",
-      response: response,
-      isApproved: isApproved,
-    };
-  } catch (error) {
-    console.error(`Error checking card: ${error.message}`);
-    return { card, status: "ERROR", response: error.message };
+    await client.sendMessage("me", { message: text });
+  } catch (err) {
+    console.error("Error sending to saved messages:", err.message);
   }
 }
 
-// Process card queue
-async function processQueue(userId) {
-  if (isChecking || cardQueue.length === 0) return;
-
-  isChecking = true;
-  approvedCards = [];
-
-  const totalCards = cardQueue.length;
-  let checked = 0;
-
-  await client.sendMessage(userId, {
-    message: `🚀 **Starting Card Check**\n📊 Total Cards: ${totalCards}\n⏳ Please wait...`,
-  });
-
-  while (cardQueue.length > 0) {
-    const cardLine = cardQueue.shift();
-    const card = parseCard(cardLine);
-
-    if (!card) {
-      checked++;
-      await client.sendMessage(userId, {
-        message: `⚠️ Invalid format: ${cardLine}`,
+// Process next card in queue
+async function processNextCard() {
+  if (cardQueue.length === 0) {
+    // All done!
+    let summary = `\n✅ **Check Complete!**\n\n📊 Total Approved: ${approvedCards.length}`;
+    if (approvedCards.length > 0) {
+      summary += `\n\n🎉 **Approved Cards:**\n`;
+      approvedCards.forEach((card, i) => {
+        summary += `${i + 1}. \`${card}\`\n`;
       });
-      continue;
     }
-
-    checked++;
-    await client.sendMessage(userId, {
-      message: `🔄 Checking [${checked}/${totalCards}]: \`${card.number.slice(0, 6)}****\``,
-    });
-
-    const result = await checkCard(card);
-
-    if (result.isApproved) {
-      approvedCards.push(result);
-      await client.sendMessage(userId, {
-        message: `\n🎉 **APPROVED CARD FOUND!** 🎉\n\n💳 CC: \`${card.formatted}\`\n\n📝 Response:\n${result.response}`,
-      });
-    } else {
-      // Just log declined, dont spam
-      console.log(`❌ Declined: ${card.number.slice(0, 6)}****`);
-    }
-
-    // Wait before next card to avoid rate limiting
-    if (cardQueue.length > 0) {
-      await delay(5000); // 5 second delay between cards
-    }
+    await sendToSavedMessages(summary);
+    isChecking = false;
+    waitingForResponse = false;
+    currentCard = null;
+    console.log("✅ All cards checked!");
+    return;
   }
 
-  // Summary
-  let summary = `\n✅ **Check Complete!**\n\n📊 Total Checked: ${totalCards}\n✅ Approved: ${approvedCards.length}\n❌ Declined: ${totalCards - approvedCards.length}`;
+  const cardLine = cardQueue.shift();
+  const card = parseCard(cardLine);
 
-  if (approvedCards.length > 0) {
-    summary += `\n\n🎉 **Approved Cards:**\n`;
-    approvedCards.forEach((r, i) => {
-      summary += `${i + 1}. \`${r.card.formatted}\`\n`;
-    });
+  if (!card) {
+    await sendToSavedMessages(`⚠️ Invalid format: ${cardLine}`);
+    // Process next immediately
+    await processNextCard();
+    return;
   }
 
-  await client.sendMessage(userId, { message: summary });
-  isChecking = false;
+  currentCard = card;
+  waitingForResponse = true;
+
+  const remaining = cardQueue.length;
+  console.log(`📤 Sending card to @KidCheck_bot: ${card.number.slice(0, 6)}**** (${remaining} remaining)`);
+
+  // Send to @KidCheck_bot
+  const command = `/st ${card.formatted}`;
+  await client.sendMessage(checkerBotEntity, { message: command });
+
+  await sendToSavedMessages(`🔄 Checking: \`${card.number.slice(0, 6)}****\` (${remaining} remaining)`);
+
+  // Now we wait for the handler to receive response from @KidCheck_bot
+  // Set a timeout in case bot doesn't respond
+  setTimeout(async () => {
+    if (waitingForResponse && currentCard && currentCard.number === card.number) {
+      console.log(`⏰ Timeout for card: ${card.number.slice(0, 6)}****`);
+      await sendToSavedMessages(`⏰ Timeout: No response for \`${card.number.slice(0, 6)}****\``);
+      waitingForResponse = false;
+      currentCard = null;
+      await delay(2000);
+      await processNextCard();
+    }
+  }, 120000); // 2 minute timeout
 }
 
 // Start the client
@@ -184,69 +131,114 @@ async function startBot() {
   });
 
   console.log("✅ Connected to Telegram!");
-  console.log("📱 Listening for messages...");
 
-  // Listen for messages from yourself (saved messages or any chat)
+  // Get my user ID
+  const me = await client.getMe();
+  myUserId = me.id.value || me.id;
+  console.log(`👤 Logged in as: ${me.firstName} (ID: ${myUserId})`);
+
+  // Get checker bot entity
+  try {
+    checkerBotEntity = await client.getEntity(CHECKER_BOT);
+    console.log(`🤖 Found @KidCheck_bot`);
+  } catch (err) {
+    console.error("❌ Could not find @KidCheck_bot:", err.message);
+  }
+
+  // Listen for ALL new messages
   client.addEventHandler(async (event) => {
     try {
       const message = event.message;
       if (!message || !message.message) return;
 
       const text = message.message.trim();
-      const senderId = message.senderId?.toString();
-      const me = await client.getMe();
-      const myId = me.id.toString();
+      const chatId = message.chatId?.value || message.chatId;
+      const senderId = message.senderId?.value || message.senderId;
+      const isFromBot = message.peerId?.className === "PeerUser" &&
+        checkerBotEntity &&
+        (senderId == checkerBotEntity.id?.value || senderId == checkerBotEntity.id);
 
-      // Only respond to your own messages
-      if (senderId !== myId) return;
+      // Check if this is a response from @KidCheck_bot
+      if (isFromBot && waitingForResponse && currentCard) {
+        console.log(`📥 Got response from @KidCheck_bot`);
 
-      // Command: /check or /chk followed by card list
-      if (text.startsWith("/check") || text.startsWith("/chk")) {
-        const cardText = text.replace(/^\/chk|^\/check/, "").trim();
-        const cards = cardText
-          .split("\n")
-          .map((c) => c.trim())
-          .filter((c) => c.length > 0);
+        // Check if this response is for our current card
+        const cardBin = currentCard.number.slice(0, 6);
+        if (text.includes(cardBin) || text.includes(currentCard.number)) {
 
-        if (cards.length === 0) {
-          await client.sendMessage(message.chatId, {
-            message:
-              "❓ **Usage:**\n/check card1\ncard2\ncard3\n\n**Format:** 4111111111111111|MM|YY|CVV",
-          });
-          return;
+          // Check if approved
+          const isApproved = text.toLowerCase().includes("approved") ||
+            text.includes("Charged") ||
+            (text.includes("✅") && !text.includes("❌"));
+
+          if (isApproved) {
+            approvedCards.push(currentCard.formatted);
+            await sendToSavedMessages(`\n🎉 **APPROVED!** 🎉\n\n💳 \`${currentCard.formatted}\`\n\n${text}`);
+          } else {
+            // Just log declined
+            await sendToSavedMessages(`❌ Declined: \`${currentCard.number.slice(0, 6)}****\``);
+          }
+
+          // Reset and process next
+          waitingForResponse = false;
+          currentCard = null;
+
+          // Wait a bit before next card
+          await delay(5000);
+          await processNextCard();
+        }
+        return;
+      }
+
+      // Handle commands from myself (from saved messages)
+      if (senderId == myUserId) {
+
+        // Start checking cards
+        if (text.startsWith("/check") || text.startsWith("/chk")) {
+          if (isChecking) {
+            await sendToSavedMessages("⏳ Already checking cards. Use /stop first.");
+            return;
+          }
+
+          const cardText = text.replace(/^\/chk|^\/check/, "").trim();
+          const cards = cardText.split("\n").map(c => c.trim()).filter(c => c.length > 0 && c.includes("|"));
+
+          if (cards.length === 0) {
+            await sendToSavedMessages("❓ **Usage:**\n/check card1\ncard2\ncard3\n\n**Format:** 4111111111111111|MM|YY|CVV");
+            return;
+          }
+
+          cardQueue = cards;
+          approvedCards = [];
+          isChecking = true;
+
+          await sendToSavedMessages(`🚀 **Starting Check**\n📊 Total Cards: ${cards.length}\n⏳ Processing...`);
+
+          // Start processing
+          await processNextCard();
         }
 
-        if (isChecking) {
-          await client.sendMessage(message.chatId, {
-            message: "⏳ Already checking cards. Please wait...",
-          });
-          return;
+        // Stop command
+        if (text === "/stop") {
+          cardQueue = [];
+          isChecking = false;
+          waitingForResponse = false;
+          currentCard = null;
+          await sendToSavedMessages("🛑 Stopped.");
         }
 
-        cardQueue = cards;
-        currentUserId = message.chatId;
-        processQueue(message.chatId);
+        // Status command
+        if (text === "/status") {
+          await sendToSavedMessages(`📊 **Status**\n🔄 Active: ${isChecking}\n📋 Queue: ${cardQueue.length}\n✅ Approved: ${approvedCards.length}`);
+        }
       }
 
-      // Stop command
-      if (text === "/stop") {
-        cardQueue = [];
-        isChecking = false;
-        await client.sendMessage(message.chatId, {
-          message: "🛑 Stopped card checking.",
-        });
-      }
-
-      // Status command
-      if (text === "/status") {
-        await client.sendMessage(message.chatId, {
-          message: `📊 **Status**\n🔄 Checking: ${isChecking}\n📋 Queue: ${cardQueue.length} cards\n✅ Approved: ${approvedCards.length}`,
-        });
-      }
     } catch (err) {
       console.error("Handler error:", err);
     }
-  });
+  }, new NewMessage({}));
+
+  console.log("📱 Listening for messages...");
 }
 
 // Start everything
